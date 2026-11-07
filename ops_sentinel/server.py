@@ -1,10 +1,12 @@
-"""Ops Sentinel MCP server.
+"""Ops Sentinel MCP server: lets Claude (or any MCP client) work the commission tracker.
 
-Exposes the ops database to any MCP client (Claude desktop, Claude Code, etc.) so an
-ops lead can ask in plain English: "what broke overnight?", "who owns the overdue
-deposits?", "mark the duplicate on GW123 as acknowledged, assign to Priya".
+Each tool call re-reads the tracker, so Claude always sees the latest edits people
+made in the spreadsheet. Ask things like:
+  "What's overdue from UK partners, oldest first?"
+  "Why is INV-KCL-021 flagged, and what should I check?"
+  "Assign the unapplied cash items to Priya and mark them acknowledged."
 
-Run:  python -m ops_sentinel.server          (stdio transport)
+Run:  python -m ops_sentinel.server     (stdio; Claude desktop starts it for you)
 """
 from __future__ import annotations
 
@@ -12,17 +14,16 @@ from typing import Literal
 
 from mcp.server.mcpserver import MCPServer
 
-from . import engine, report
-from .db import connect
-from .generate import simulate_day
-from .rules import RULES, RULES_BY_CODE, SEVERITY_ORDER
+from .engine import Engine
+from .report import markdown, write_html
+from .rules import RULES, RULES_BY_CODE
 
 mcp = MCPServer(
     "ops-sentinel",
     instructions=(
-        "Payments & receivables operations monitor. Call run_checks first to refresh the issue "
-        "register, then get_kpis / list_issues. Use explain_issue before recommending an action. "
-        "All data is synthetic."
+        "Commission receivables monitor over a spreadsheet tracker (cases, invoices, partner payments, accruals). "
+        "Call run_checks first to refresh, then use get_kpis / list_issues. Call explain_issue before recommending "
+        "an action. Amounts in issues are INR; invoice amounts are in the partner's currency. Data is synthetic."
     ),
 )
 
@@ -30,141 +31,104 @@ Severity = Literal["critical", "high", "medium", "low"]
 Status = Literal["open", "acknowledged", "resolved"]
 
 
-def _conn():
-    return connect()
+def _engine() -> Engine:
+    return Engine()
 
 
 @mcp.tool()
 def run_checks() -> dict:
-    """Run every operational check against the latest data and update the issue register.
-    Returns counts of new, reopened and auto-resolved issues plus total amount at risk."""
-    with _conn() as c:
-        return engine.run_checks(c)
+    """Run every check on the tracker and write results back to it (tracker status columns, Issues, KPIs).
+    Returns how many issues are new, reopened and auto-resolved, plus INR at risk."""
+    r = _engine().run()
+    return {k: v for k, v in r.__dict__.items() if k != "kpis"}
 
 
 @mcp.tool()
-def get_kpis(window_days: int = 30) -> dict:
-    """Headline ops KPIs over a trailing window: collection rate, reconciliation match rate,
-    invoice coverage, visa-to-invoice cycle time, commission realisation, open issues, ₹ at risk."""
-    with _conn() as c:
-        return engine.kpis(c, window_days)
+def get_kpis() -> dict:
+    """Headline receivables KPIs: outstanding and overdue (with ageing buckets), unbilled commission,
+    unapplied cash, collection rate, invoice coverage, days to invoice / collect, accrual accuracy. INR."""
+    return _engine().kpis()
 
 
 @mcp.tool()
-def list_issues(severity: Severity | None = None, rule: str | None = None,
+def list_issues(severity: Severity | None = None, check: str | None = None, partner: str | None = None,
                 status: Status | None = None, limit: int = 25) -> list[dict]:
-    """List issues from the register, most severe and highest ₹ first.
-    Filter by severity, rule code (see list_rules) or status. Default excludes resolved."""
-    sql, args = "SELECT * FROM issues WHERE 1=1", []
-    if severity:
-        sql += " AND severity = ?"; args.append(severity)
-    if rule:
-        sql += " AND rule = ?"; args.append(rule.upper())
+    """Issues from the Issues tab, most severe and highest INR first. Open + acknowledged by default.
+    Filter by severity, check code (see list_checks), partner name (partial match) or status."""
+    e = _engine()
+    rows = list(e.issues.values()) if status else e.open_issues()
     if status:
-        sql += " AND status = ?"; args.append(status)
-    else:
-        sql += " AND status != 'resolved'"
-    with _conn() as c:
-        rows = [dict(r) for r in c.execute(sql, args)]
-    rows.sort(key=lambda r: (SEVERITY_ORDER[r["severity"]], -r["amount_at_risk"]))
+        rows = [i for i in rows if str(i.get("status")).lower() == status]
+    if severity:
+        rows = [i for i in rows if i.get("severity") == severity]
+    if check:
+        rows = [i for i in rows if i.get("check") == check.upper()]
+    if partner:
+        rows = [i for i in rows if partner.lower() in str(i.get("partner", "")).lower()]
     return rows[:limit]
 
 
 @mcp.tool()
 def explain_issue(issue_id: str) -> dict:
-    """Why an issue matters, root-cause questions to check, and the underlying records."""
-    with _conn() as c:
-        row = c.execute("SELECT * FROM issues WHERE issue_id = ?", (issue_id,)).fetchone()
-        if not row:
-            return {"error": f"No issue {issue_id}"}
-        rule = RULES_BY_CODE[row["rule"]]
-        entity = row["entity"]
-        evidence = {}
-        for table, col in (("deposits", "deposit_id"), ("cases", "case_id"), ("invoices", "invoice_id"),
-                           ("ledger", "txn_id"), ("ledger", "gateway_ref")):
-            recs = [dict(r) for r in c.execute(f"SELECT * FROM {table} WHERE {col} = ?", (entity,))]
-            if recs:
-                evidence.setdefault(table, []).extend(recs)
-        return {"issue": dict(row), "check": rule.title, "why_it_matters": rule.why_it_matters,
-                "root_cause_checklist": rule.rca_hints, "evidence": evidence}
+    """Why an issue matters, what to check first, and the underlying tracker rows and payments."""
+    e = _engine()
+    i = e.issues.get(issue_id)
+    if not i:
+        return {"error": f"No issue {issue_id}. Use list_issues to see IDs."}
+    rule = RULES_BY_CODE[i["check"]]
+    evidence = e.case(i["ref"]) if i["check"] not in ("UNAPPLIED_CASH", "ACCRUAL_VARIANCE") else None
+    if i["check"] == "UNAPPLIED_CASH":
+        evidence = {"remittance": next((dict(r) for r in e.db.execute("SELECT * FROM remittances WHERE remittance_id=?",
+                                                                       (i["ref"],))), None),
+                    "possible_matches": [dict(r) for r in e.db.execute(
+                        """SELECT case_id, invoice_no, invoice_amount, due_date FROM cases WHERE partner=? AND invoice_no<>''
+                           AND received=0 ORDER BY ABS(invoice_amount - (SELECT amount FROM remittances WHERE remittance_id=?))
+                           LIMIT 3""", (i["partner"], i["ref"]))]}
+    return {"issue": i, "check": rule.title, "why_it_matters": rule.why, "check_first": rule.first_checks,
+            "evidence": evidence}
 
 
 @mcp.tool()
-def update_issue(issue_id: str, status: Status, owner: str | None = None, note: str | None = None) -> dict:
-    """Acknowledge, assign or resolve an issue. Resolved issues reopen automatically if the
-    condition is still true on the next run_checks."""
-    with _conn() as c:
-        cur = c.execute("""UPDATE issues SET status=?, owner=COALESCE(?, owner), note=COALESCE(?, note),
-                           resolved_at = CASE WHEN ?='resolved' THEN (SELECT value FROM meta WHERE key='as_of') ELSE NULL END
-                           WHERE issue_id=?""", (status, owner, note, status, issue_id))
-        c.commit()
-        if cur.rowcount == 0:
-            return {"error": f"No issue {issue_id}"}
-        return dict(c.execute("SELECT * FROM issues WHERE issue_id=?", (issue_id,)).fetchone())
+def update_issue(issue_id: str, status: Status | None = None, owner: str | None = None, note: str | None = None) -> dict:
+    """Acknowledge, assign or resolve an issue; saved to the Issues tab. A 'resolved' issue reopens
+    automatically on the next run if the tracker still shows the problem."""
+    r = _engine().update_issue(issue_id, status, owner, note)
+    return r or {"error": f"No issue {issue_id}"}
 
 
 @mcp.tool()
-def case_timeline(case_id: str) -> dict:
-    """Everything known about one case: stage, deposit, gateway settlements, invoice, open issues."""
-    with _conn() as c:
-        case = c.execute("SELECT * FROM cases WHERE case_id=?", (case_id,)).fetchone()
-        if not case:
-            return {"error": f"No case {case_id}"}
-        dep = [dict(r) for r in c.execute("SELECT * FROM deposits WHERE case_id=?", (case_id,))]
-        refs = [d["gateway_ref"] for d in dep if d["gateway_ref"]]
-        ledger = [dict(r) for r in c.execute(
-            f"SELECT * FROM ledger WHERE gateway_ref IN ({','.join('?' * len(refs)) or 'NULL'})", refs)]
-        inv = [dict(r) for r in c.execute("SELECT * FROM invoices WHERE case_id=?", (case_id,))]
-        ids = [case_id] + [d["deposit_id"] for d in dep] + [i["invoice_id"] for i in inv]
-        issues = [dict(r) for r in c.execute(
-            f"SELECT issue_id, severity, summary, status FROM issues WHERE entity IN ({','.join('?' * len(ids))})", ids)]
-        return {"case": dict(case), "deposits": dep, "settlements": ledger, "invoices": inv, "issues": issues}
+def lookup(ref: str) -> dict:
+    """Everything about one case or invoice (e.g. C0107 or INV-KCL-012): tracker row, payments applied, issues."""
+    return _engine().case(ref) or {"error": f"Nothing found for {ref}"}
 
 
 @mcp.tool()
-def owner_breakdown() -> list[dict]:
-    """Open deposit/case issues grouped by counsellor, to spot whose pipeline needs help."""
-    with _conn() as c:
-        rows = c.execute("""
-            SELECT c.counsellor, i.rule, COUNT(*) n, SUM(i.amount_at_risk) amt
-            FROM issues i
-            JOIN cases c ON c.case_id = i.entity OR c.case_id = (SELECT case_id FROM deposits WHERE deposit_id = i.entity)
-            WHERE i.status != 'resolved' GROUP BY c.counsellor, i.rule ORDER BY amt DESC""")
-        return [dict(r) for r in rows]
+def partner_ageing() -> list[dict]:
+    """Outstanding commission per partner split into Not due / 1-30 / 31-60 / 60+ days (INR), oldest first."""
+    return _engine().partner_ageing()
 
 
 @mcp.tool()
 def daily_report(fmt: Literal["markdown", "html"] = "markdown") -> str:
-    """Generate the daily ops report. markdown returns the text (paste into Slack/email);
+    """Run the checks and produce the daily report. markdown returns text to paste into email or Slack;
     html writes a standalone file and returns its path."""
-    with _conn() as c:
-        engine.run_checks(c)
-        if fmt == "html":
-            return str(report.write_html(c).resolve())
-        return report.markdown(c)
+    e = _engine()
+    e.run()
+    return str(write_html(e).resolve()) if fmt == "html" else markdown(e)
 
 
 @mcp.tool()
-def list_rules() -> list[dict]:
+def list_checks() -> list[dict]:
     """The checks Ops Sentinel runs, what each catches and why it matters."""
-    return [{"code": r.code, "title": r.title, "why_it_matters": r.why_it_matters} for r in RULES]
-
-
-@mcp.tool()
-def simulate_next_day() -> dict:
-    """DEMO ONLY: advance the synthetic clock one day (new payments, new cases), then re-run checks."""
-    with _conn() as c:
-        sim = simulate_day(c)
-        sim["checks"] = engine.run_checks(c)
-        return sim
+    return [{"code": r.code, "title": r.title, "why_it_matters": r.why} for r in RULES]
 
 
 @mcp.prompt()
 def morning_standup() -> str:
-    """Prompt template: the 9am ops stand-up."""
-    return ("Run run_checks, then get_kpis. Summarise in 5 bullets: what's new since yesterday, the top 3 "
-            "issues by ₹ at risk (use explain_issue on each and give the first thing to check), any KPI "
-            "that moved more than 5 points, and which owner needs help (owner_breakdown).")
+    """The 9am receivables stand-up."""
+    return ("Run run_checks, then get_kpis and partner_ageing. In 6 bullets: what's new since yesterday; the 3 biggest "
+            "issues by INR at risk (use explain_issue on each and say what to check first); which partner needs an "
+            "escalation email; unbilled commission to invoice today; anything unassigned that's critical.")
 
 
 def main() -> None:

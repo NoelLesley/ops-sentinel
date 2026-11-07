@@ -1,9 +1,12 @@
-"""Command line entry point (for cron / GitHub Actions).
+"""Command line (for you, cron, or GitHub Actions).
 
-  python -m ops_sentinel.cli seed            # build fresh synthetic data as of today
-  python -m ops_sentinel.cli check           # run checks, print summary
-  python -m ops_sentinel.cli report          # run checks, write HTML + print markdown
-  python -m ops_sentinel.cli tick            # advance synthetic clock one day
+  python -m ops_sentinel.cli sample            # (re)build data/sample_tracker.xlsx with fake data
+  python -m ops_sentinel.cli run               # check the tracker and write results back into it
+  python -m ops_sentinel.cli report            # run + write an HTML report + print the summary
+
+Which tracker? Set OPS_SOURCE (see sources.py), or pass --source:
+  --source xlsx:data/sample_tracker.xlsx
+  --source sheets:<google spreadsheet id>
 """
 from __future__ import annotations
 
@@ -11,35 +14,34 @@ import argparse
 import json
 from datetime import date
 
-from . import engine, report
-from .db import connect
-from .generate import generate, simulate_day
+from .engine import Engine
+from .generate import build, write_xlsx
+from .report import markdown, write_html
+from .sources import ROOT, get_source
 
 
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(prog="ops-sentinel")
+    p.add_argument("--source", help="xlsx:<path> or sheets:<spreadsheet id>")
+    p.add_argument("--as-of", type=date.fromisoformat, help="pretend today is this date (YYYY-MM-DD)")
     sub = p.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("seed"); s.add_argument("--as-of", type=date.fromisoformat); s.add_argument("--seed", type=int, default=7)
-    sub.add_parser("check")
-    r = sub.add_parser("report"); r.add_argument("--out", default="reports")
-    sub.add_parser("tick")
+    s = sub.add_parser("sample")
+    s.add_argument("--out", default=str(ROOT / "data" / "sample_tracker.xlsx"))
+    sub.add_parser("run")
+    r = sub.add_parser("report")
+    r.add_argument("--out", default="reports")
     a = p.parse_args(argv)
 
-    if a.cmd == "seed":
-        conn = generate(as_of=a.as_of, seed=a.seed)
-        print(json.dumps(engine.run_checks(conn), indent=2))
+    if a.cmd == "sample":
+        print(f"Wrote {write_xlsx(build(as_of=a.as_of), a.out)}")
         return
-    conn = connect()
-    if a.cmd == "check":
-        print(json.dumps(engine.run_checks(conn), indent=2))
-    elif a.cmd == "report":
-        engine.run_checks(conn)
-        print(f"HTML report: {report.write_html(conn, a.out)}\n")
-        print(report.markdown(conn))
-    elif a.cmd == "tick":
-        out = simulate_day(conn)
-        out["checks"] = engine.run_checks(conn)
-        print(json.dumps(out, indent=2))
+    engine = Engine(get_source(a.source), as_of=a.as_of)
+    result = engine.run()
+    if a.cmd == "run":
+        print(json.dumps(result.__dict__, indent=2, default=str))
+    else:
+        print(f"HTML report: {write_html(engine, a.out)}\n")
+        print(markdown(engine))
 
 
 if __name__ == "__main__":

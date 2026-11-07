@@ -1,9 +1,9 @@
 [project]
 name = "ops-sentinel"
-version = "0.1.0"
-description = "MCP server that monitors payments & receivables operations: reconciliation, collections, invoicing and commission ageing."
+version = "0.2.0"
+description = "Monitors a commission receivables tracker (Google Sheets or Excel): reconciliation, ageing, revenue leakage, accrual variance. Includes an MCP server for Claude."
 requires-python = ">=3.10"
-dependencies = ["mcp>=2.0"]
+dependencies = ["mcp>=2.0", "openpyxl>=3.1", "gspread>=6.0"]
 
 [project.optional-dependencies]
 dev = ["pytest"]

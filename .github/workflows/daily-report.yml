@@ -1,5 +1,5 @@
-# Runs the checks every morning at 08:30 IST and publishes the report as a build artifact.
-name: daily-ops-report
+# Runs the checks on the sample tracker every morning at 08:30 IST and saves the report.
+name: daily-receivables-report
 on:
   schedule:
     - cron: "0 3 * * *"        # 03:00 UTC = 08:30 IST
@@ -13,7 +13,7 @@ jobs:
         with: { python-version: "3.12" }
       - run: pip install -e ".[dev]"
       - run: pytest -q
-      - run: python -m ops_sentinel.cli seed && python -m ops_sentinel.cli report --out reports | tee summary.md
+      - run: python -m ops_sentinel.cli report --out reports | tee summary.md
       - run: cat summary.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
-        with: { name: ops-report, path: reports/ }
+        with: { name: receivables-report, path: reports/ }

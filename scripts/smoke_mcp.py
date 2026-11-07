@@ -1,4 +1,4 @@
-"""End-to-end smoke test: start the MCP server over stdio and call its tools like Claude would."""
+"""Start the MCP server over stdio and call its tools the way Claude would."""
 import asyncio
 import json
 import sys
@@ -12,21 +12,13 @@ async def main():
     async with stdio_client(params) as (r, w):
         async with ClientSession(r, w) as s:
             await s.initialize()
-            tools = await s.list_tools()
-            print("tools:", [t.name for t in tools.tools])
-            for name, args in [("run_checks", {}), ("get_kpis", {}),
-                               ("list_issues", {"severity": "critical", "limit": 2}),
-                               ("explain_issue", {"issue_id": None}),
-                               ("owner_breakdown", {})]:
-                if name == "explain_issue":
-                    args = {"issue_id": first_id}
+            print("tools:", [t.name for t in (await s.list_tools()).tools])
+            for name, args in [("run_checks", {}), ("list_issues", {"severity": "critical", "limit": 2}),
+                               ("explain_issue", {"issue_id": "UNAPPLIED_CASH:REM-0003"}),
+                               ("lookup", {"ref": "C0107"}), ("partner_ageing", {})]:
                 res = await s.call_tool(name, args)
                 text = res.content[0].text if res.content else json.dumps(res.structured_content)
-                if name == "list_issues":
-                    data = res.structured_content or json.loads(text)
-                    data = data.get("result", data) if isinstance(data, dict) else data
-                    first_id = data[0]["issue_id"]
-                print(f"\n== {name} ==\n{text[:600]}")
+                print(f"\n== {name} {args} ==\n{text[:500]}")
 
 
 asyncio.run(main())

@@ -1,11 +1,10 @@
 {
   "mcpServers": {
     "ops-sentinel": {
-      "command": "python3",
-      "args": ["-m", "ops_sentinel.server"],
+      "command": "/opt/homebrew/bin/uv",
+      "args": ["run", "--directory", "/Users/YOU/analyst-practice/ops-sentinel", "python", "-m", "ops_sentinel.server"],
       "env": {
-        "PYTHONPATH": "/ABSOLUTE/PATH/TO/ops-sentinel",
-        "OPS_SENTINEL_DB": "/ABSOLUTE/PATH/TO/ops-sentinel/data/ops.db"
+        "OPS_SOURCE": "xlsx:/Users/YOU/analyst-practice/ops-sentinel/data/sample_tracker.xlsx"
       }
     }
   }

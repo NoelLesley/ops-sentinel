@@ -2,97 +2,146 @@ from datetime import date
 
 import pytest
 
-from ops_sentinel import engine
-from ops_sentinel.db import connect, set_meta
-from ops_sentinel.generate import generate, simulate_day
+from ops_sentinel import schema as S
+from ops_sentinel.engine import Engine
+from ops_sentinel.generate import build, write_xlsx
+from ops_sentinel.model import build_db, to_date
 from ops_sentinel.rules import RULES, inr, run_all
+from ops_sentinel.sources import ExcelSource, SheetsSource
 
 AS_OF = date(2026, 11, 7)
+PARTNER = ["Test Uni", "UK", "GBP", 0.15, 30, "x@example.edu"]
 
 
-@pytest.fixture
-def conn(tmp_path):
-    c = connect(tmp_path / "t.db")
-    set_meta(c, "as_of", AS_OF.isoformat())
-    return c
+def case(cid="C1", fee=20000, visa="Approved", approved="2026-08-01", enrolled="Yes",
+         inv="", inv_date="", amount="", due=""):
+    d = dict(case_id=cid, student="S", counsellor="A", partner="Test Uni", country="UK", currency="GBP",
+             intake="Sep 2026", tuition_fee=fee, visa_status=visa, visa_approved_on=approved,
+             enrolment_confirmed=enrolled, invoice_no=inv, invoice_date=inv_date, invoice_amount=amount, due_date=due)
+    return d
 
 
-def add_case(c, cid, stage="deposit_paid", stage_at="2026-11-01", visa=None):
-    c.execute("INSERT INTO cases VALUES (?,?,?,?,?,?,?,?)", (cid, "Test Student", "Counsellor A", "Uni", "UK", stage, stage_at, visa))
+def tabs(cases, remits=(), accruals=()):
+    return {S.TRACKER: S.dicts_to_rows(S.TRACKER_HEADERS, cases),
+            S.PARTNERS: [S.PARTNER_HEADERS, PARTNER],
+            S.FX: [S.FX_HEADERS, ["GBP", 100, "2026-11-01"]],
+            S.REMITTANCES: [S.REMITTANCE_HEADERS] + [list(r) for r in remits],
+            S.ACCRUALS: [S.ACCRUAL_HEADERS] + [list(a) for a in accruals]}
 
 
-def add_deposit(c, did, cid, amount=100_000, due="2026-11-01", received=None, ref=None, status=None):
-    c.execute("INSERT INTO deposits VALUES (?,?,?,?,?,?,?,?)",
-              (did, cid, amount, amount if received else None, due, received, ref, status or ("received" if received else "pending")))
+def checks(t):
+    db, unmatched = build_db(t)
+    return {f.issue_id: f for f in run_all(db, AS_OF, unmatched)}
 
 
-def add_txn(c, tid, ref, amount, when="2026-11-01"):
-    c.execute("INSERT INTO ledger VALUES (?,?,?,?,?)", (tid, ref, amount, when, "UPI"))
+def test_inr_and_dates():
+    assert inr(5190500) == "₹51,90,500" and inr(999) == "₹999"
+    assert to_date("07/11/2026") == "2026-11-07" and to_date(46333) == "2026-11-07" and to_date("") == ""
 
 
-def rules_hit(c):
-    return {f.rule for f in run_all(c, AS_OF)}
+def test_clean_paid_case_has_no_issues():
+    c = case(inv="INV-1", inv_date="2026-08-10", amount=3000, due="2026-09-09")
+    assert checks(tabs([c], [["R1", "2026-09-01", "Test Uni", "GBP", 3000, "INV-1", "B", ""]])) == {}
 
 
-def test_inr_grouping():
-    assert inr(5190500) == "₹51,90,500"
-    assert inr(999) == "₹999"
-    assert inr(100000) == "₹1,00,000"
+def test_invoice_not_raised_respects_sla():
+    found = checks(tabs([case("C1", approved="2026-09-01"), case("C2", approved="2026-11-01")]))
+    assert "INVOICE_NOT_RAISED:C1" in found and "INVOICE_NOT_RAISED:C2" not in found
+    assert found["INVOICE_NOT_RAISED:C1"].at_risk_inr == 20000 * 0.15 * 100
 
 
-def test_clean_case_raises_nothing(conn):
-    add_case(conn, "C1")
-    add_deposit(conn, "D1", "C1", received="2026-10-30", ref="GW1")
-    add_txn(conn, "T1", "GW1", 100_000)
-    assert rules_hit(conn) == set()
+def test_overdue_ageing_severity():
+    t = tabs([case("C1", inv="I1", inv_date="2026-09-01", amount=3000, due="2026-10-25"),
+              case("C2", inv="I2", inv_date="2026-06-01", amount=3000, due="2026-07-01")])
+    f = checks(t)
+    assert f["COMMISSION_OVERDUE:I1"].severity == "medium" and f["COMMISSION_OVERDUE:I2"].severity == "critical"
 
 
-def test_duplicate_and_mismatch_and_orphan(conn):
-    add_case(conn, "C1"); add_deposit(conn, "D1", "C1", received="2026-10-30", ref="GW1")
-    add_txn(conn, "T1", "GW1", 100_000); add_txn(conn, "T2", "GW1", 100_000)      # duplicate
-    add_case(conn, "C2"); add_deposit(conn, "D2", "C2", received="2026-10-30", ref="GW2")
-    add_txn(conn, "T3", "GW2", 97_500)                                              # short
-    add_txn(conn, "T4", "GW_UNKNOWN", 50_000)                                       # orphan
-    found = {f.issue_id: f for f in run_all(conn, AS_OF)}
-    assert found["DUPLICATE_SETTLEMENT:GW1"].amount_at_risk == 100_000
-    assert found["AMOUNT_MISMATCH:D2"].amount_at_risk == 2_500
-    assert "UNRECONCILED_SETTLEMENT:T4" in found
+def test_short_bank_charges_over_and_unapplied():
+    cs = [case("C1", inv="I1", inv_date="2026-08-01", amount=3000, due="2026-09-01"),
+          case("C2", inv="I2", inv_date="2026-08-01", amount=3000, due="2026-09-01"),
+          case("C3", inv="I3", inv_date="2026-08-01", amount=3000, due="2026-09-01")]
+    rs = [["R1", "2026-09-01", "Test Uni", "GBP", 2400, "I1", "B", ""],      # 20% short
+          ["R2", "2026-09-01", "Test Uni", "GBP", 2975, "I2", "B", ""],      # bank charges
+          ["R3", "2026-09-01", "Test Uni", "GBP", 3000, "I3", "B", ""],
+          ["R4", "2026-09-05", "Test Uni", "GBP", 3000, "I3", "B", ""],      # paid twice
+          ["R5", "2026-09-05", "Test Uni", "GBP", 1000, "I9X", "B", ""]]     # unknown ref
+    f = checks(tabs(cs, rs))
+    assert f["SHORT_PAYMENT:I1"].severity == "high"
+    assert f["BANK_CHARGES:I2"].severity == "low"
+    assert f["OVERPAYMENT:I3"].at_risk_inr == 3000 * 100
+    assert "UNAPPLIED_CASH:R5" in f
 
 
-def test_overdue_severity_escalates(conn):
-    add_case(conn, "C1", stage="offer"); add_deposit(conn, "D1", "C1", due="2026-11-04")
-    add_case(conn, "C2", stage="offer"); add_deposit(conn, "D2", "C2", due="2026-10-10")
-    add_case(conn, "C3", stage="dropped"); add_deposit(conn, "D3", "C3", due="2026-09-01", status="cancelled")
-    sev = {f.entity: f.severity for f in run_all(conn, AS_OF) if f.rule == "DEPOSIT_OVERDUE"}
-    assert sev == {"D1": "medium", "D2": "high"}
+def test_batch_remittance_splits_across_invoices():
+    cs = [case("C1", inv="I1", inv_date="2026-08-01", amount=3000, due="2026-09-01"),
+          case("C2", inv="I2", inv_date="2026-08-01", amount=1000, due="2026-09-01")]
+    f = checks(tabs(cs, [["R1", "2026-09-01", "Test Uni", "GBP", 4000, "I1; I2", "B", ""]]))
+    assert not any(k.startswith(("SHORT", "COMMISSION_OVERDUE", "UNAPPLIED")) for k in f)
 
 
-def test_invoice_leakage_respects_sla(conn):
-    add_case(conn, "C1", stage="visa_approved", visa="2026-10-20"); add_deposit(conn, "D1", "C1", received="2026-10-01", ref="G1"); add_txn(conn, "T1", "G1", 100_000)
-    add_case(conn, "C2", stage="visa_approved", visa="2026-11-05"); add_deposit(conn, "D2", "C2", received="2026-10-01", ref="G2"); add_txn(conn, "T2", "G2", 100_000)
-    hits = [f.entity for f in run_all(conn, AS_OF) if f.rule == "INVOICE_NOT_RAISED"]
-    assert hits == ["C1"]                      # C2 is still inside the 7-day SLA
+def test_rate_mismatch_and_duplicate_invoice():
+    cs = [case("C1", inv="I1", inv_date="2026-10-01", amount=2400, due="2026-12-01"),   # 12% billed vs 15%
+          case("C2", inv="I1", inv_date="2026-10-02", amount=3000, due="2026-12-01")]
+    f = checks(tabs(cs))
+    assert "RATE_MISMATCH:I1" in f and f["DUPLICATE_INVOICE_NO:I1"].severity == "critical"
 
 
-def test_issue_lifecycle_auto_resolve_and_reopen(conn):
-    add_case(conn, "C1", stage="offer"); add_deposit(conn, "D1", "C1", due="2026-11-01")
-    assert engine.run_checks(conn)["new"] == 1
-    conn.execute("UPDATE deposits SET status='received', received_at='2026-11-07', amount_received=100000, gateway_ref='G1'")
-    add_txn(conn, "T1", "G1", 100_000, "2026-11-07")
-    assert engine.run_checks(conn)["auto_resolved"] == 1
-    conn.execute("UPDATE deposits SET status='pending', received_at=NULL, gateway_ref=NULL")
-    conn.execute("DELETE FROM ledger")
-    assert engine.run_checks(conn)["reopened"] == 1
+def test_lifecycle_keeps_human_edits_auto_resolves_and_reopens(tmp_path):
+    p = tmp_path / "t.xlsx"
+    t = tabs([case("C1", approved="2026-09-01")])
+    t[S.ISSUES] = [S.ISSUE_HEADERS]
+    write_xlsx(t, p)
+
+    assert Engine(ExcelSource(p), as_of=AS_OF).run().new == 1
+    e = Engine(ExcelSource(p), as_of=AS_OF)
+    e.update_issue("INVOICE_NOT_RAISED:C1", status="acknowledged", owner="Priya")
+    e = Engine(ExcelSource(p), as_of=AS_OF)
+    e.run()
+    assert e.issues["INVOICE_NOT_RAISED:C1"]["owner"] == "Priya"            # human edit survives a run
+
+    src = ExcelSource(p)                                                     # someone raises the invoice
+    ws = src.wb[S.TRACKER]
+    col = {S.key(c.value): c.column for c in ws[1]}
+    ws.cell(2, col["invoice_no"]).value, ws.cell(2, col["invoice_date"]).value = "I1", "2026-11-06"
+    ws.cell(2, col["invoice_amount"]).value, ws.cell(2, col["due_date"]).value = 3000, "2026-12-06"
+    src.save()
+    assert Engine(ExcelSource(p), as_of=AS_OF).run().auto_resolved == 1
+
+    e = Engine(ExcelSource(p), as_of=AS_OF)
+    tracker = ExcelSource(p).read(S.TRACKER)
+    assert tracker[1][tracker[0].index("Recon Status")] == "Invoiced, not due"   # engine filled the tracker
 
 
-def test_generated_data_trips_every_rule(tmp_path):
-    c = generate(tmp_path / "g.db", as_of=AS_OF)
-    assert rules_hit(c) >= {r.code for r in RULES} - {"SETTLEMENT_VOLUME_DROP"}
+def test_sample_data_trips_every_check(tmp_path):
+    p = write_xlsx(build(as_of=AS_OF), tmp_path / "s.xlsx")
+    e = Engine(ExcelSource(p), as_of=AS_OF)
+    e.run()
+    assert {i["check"] for i in e.open_issues()} == {r.code for r in RULES}
 
 
-def test_simulate_day_moves_clock(tmp_path):
-    c = generate(tmp_path / "g.db", as_of=AS_OF)
-    engine.run_checks(c)
-    out = simulate_day(c, seed=1)
-    assert out["as_of"] == "2026-11-08" and out["new_cases"] > 0
-    assert engine.kpis(c)["as_of"] == "2026-11-08"
+def test_sheets_source_with_fake_client():
+    class WS:
+        def __init__(self, title, rows): self.title, self.rows, self.row_count = title, rows, 100
+        def get_all_values(self, **kw): return self.rows
+        def clear(self): self.rows = []
+        def batch_clear(self, ranges): pass
+        def update(self, rows, start, **kw): self.rows = rows if start == "A1" else self.rows
+
+    class SH:
+        title = "Fake"
+        def __init__(self, tabs): self.ws = {k: WS(k, v) for k, v in tabs.items()}
+        def worksheet(self, t):
+            if t not in self.ws: raise KeyError(t)
+            return self.ws[t]
+        def add_worksheet(self, title, rows, cols): self.ws[title] = WS(title, []); return self.ws[title]
+        def worksheets(self): return list(self.ws.values())
+
+    class Client:
+        def __init__(self, tabs): self.sh = SH(tabs)
+        def open_by_key(self, k): return self.sh
+
+    t = tabs([case("C1", approved="2026-09-01")])
+    client = Client(t)
+    res = Engine(SheetsSource("abc", client=client), as_of=AS_OF).run()
+    assert res.new == 1 and client.sh.ws[S.ISSUES].rows[1][0] == "INVOICE_NOT_RAISED:C1"

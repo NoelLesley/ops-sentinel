@@ -1,11 +1,9 @@
-"""Operational checks. Each rule is a pure function: (conn, as_of, cfg) -> list[Finding].
-
-Rules are deliberately written as plain SQL so an ops team can read and tune them.
+"""The checks. Each one is a short SQL query over the `cases` view (see model.py)
+that returns the rows breaking a rule. Thresholds live in Config so ops can tune them.
 """
 from __future__ import annotations
 
 import sqlite3
-import statistics
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Callable
@@ -13,196 +11,233 @@ from typing import Callable
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
 
-@dataclass
-class Finding:
-    rule: str
-    severity: str
-    entity: str
-    summary: str
-    amount_at_risk: float = 0.0
+def inr(x: float) -> str:
+    """Indian digit grouping: 5190500 -> ₹51,90,500"""
+    neg, n = x < 0, f"{abs(round(x or 0)):d}"
+    if len(n) > 3:
+        head, tail = n[:-3], n[-3:]
+        parts = []
+        while len(head) > 2:
+            parts.insert(0, head[-2:])
+            head = head[:-2]
+        if head:
+            parts.insert(0, head)
+        n = ",".join(parts) + "," + tail
+    return f"{'-' if neg else ''}₹{n}"
 
-    @property
-    def issue_id(self) -> str:
-        return f"{self.rule}:{self.entity}"
+
+def money(amount: float, ccy: str) -> str:
+    sym = {"GBP": "£", "USD": "$", "EUR": "€", "CAD": "C$", "AUD": "A$"}.get(ccy, ccy + " ")
+    return f"{sym}{amount:,.0f}"
+
+
+def code(name: str) -> str:
+    return "".join(w[0] for w in name.split())[:3].upper()
 
 
 @dataclass
 class Config:
-    deposit_grace_days: int = 0          # overdue the day after due date
-    deposit_escalate_days: int = 14      # overdue this long -> high
-    invoice_sla_days: int = 7            # visa approved -> invoice raised
-    stale_case_days: int = 21            # no stage movement
-    volume_z_threshold: float = -2.0     # daily settlement volume vs trailing 14 days
-    volume_lookback_days: int = 14
+    invoice_sla_days: int = 21          # visa approved -> invoice should be raised
+    enrolment_chase_days: int = 30      # visa approved but enrolment still unconfirmed
+    bank_charge_tolerance: float = 50   # shortfall up to this (in invoice currency) = bank charges
+    rate_tolerance_pct: float = 1.0     # invoice vs fee x partner rate
+    accrual_variance_pct: float = 25.0  # actual vs accrued, per partner-month
+    accrual_close_days: int = 30        # only judge months that ended this long ago
+    accrual_min_gap_inr: float = 100_000  # ignore small partner-months
+
+
+@dataclass
+class Finding:
+    rule: str
+    severity: str
+    ref: str
+    partner: str
+    summary: str
+    at_risk_inr: float = 0.0
+
+    @property
+    def issue_id(self) -> str:
+        return f"{self.rule}:{self.ref}"
 
 
 @dataclass
 class Rule:
     code: str
     title: str
-    why_it_matters: str
-    rca_hints: list[str]
-    fn: Callable[[sqlite3.Connection, date, Config], list[Finding]] = field(repr=False)
+    why: str
+    first_checks: list[str]
+    fn: Callable = field(repr=False)
 
 
-def inr(x: float) -> str:
-    """Indian digit grouping: 5190500 -> ₹51,90,500"""
-    neg, n = x < 0, f"{abs(round(x)):d}"
-    if len(n) > 3:
-        head, tail = n[:-3], n[-3:]
-        head = ",".join([head[max(0, i - 2):i] for i in range(len(head), 0, -2)][::-1])
-        n = f"{head},{tail}"
-    return f"{'-' if neg else ''}₹{n}"
+Ctx = tuple[sqlite3.Connection, date, Config, list[dict]]   # db, as_of, config, unmatched remittances
 
 
-# ---------------------------------------------------------------- reconciliation
-def duplicate_settlement(conn, as_of, cfg):
-    rows = conn.execute("""
-        SELECT gateway_ref, COUNT(*) n, SUM(amount) total, MIN(amount) one
-        FROM ledger WHERE txn_at <= ? GROUP BY gateway_ref HAVING n > 1""", (as_of.isoformat(),))
-    return [Finding("DUPLICATE_SETTLEMENT", "critical", r["gateway_ref"],
-                    f"{r['n']} settlements for gateway ref {r['gateway_ref']} (total {inr(r['total'])}); likely double charge",
-                    r["total"] - r["one"]) for r in rows]
+def _iso(d: date) -> str:
+    return d.isoformat()
 
 
-def orphan_settlement(conn, as_of, cfg):
-    rows = conn.execute("""
-        SELECT l.txn_id, l.gateway_ref, l.amount, l.txn_at FROM ledger l
-        LEFT JOIN deposits d ON d.gateway_ref = l.gateway_ref
-        WHERE d.deposit_id IS NULL AND l.txn_at <= ?""", (as_of.isoformat(),))
-    return [Finding("UNRECONCILED_SETTLEMENT", "high", r["txn_id"],
-                    f"{inr(r['amount'])} settled on {r['txn_at']} (ref {r['gateway_ref']}) with no matching deposit",
-                    r["amount"]) for r in rows]
+def duplicate_invoice_no(db, as_of, cfg, _):
+    rows = db.execute("""SELECT invoice_no, partner, GROUP_CONCAT(case_id, ', ') ids, COUNT(*) n,
+                                SUM(invoice_amount * inr_rate) - MAX(invoice_amount * inr_rate) extra
+                         FROM cases WHERE invoice_no <> '' GROUP BY invoice_no HAVING n > 1""")
+    return [Finding("DUPLICATE_INVOICE_NO", "critical", r["invoice_no"], r["partner"],
+                    f"Invoice {r['invoice_no']} is used on {r['n']} cases ({r['ids']}); payments can't be matched reliably",
+                    r["extra"]) for r in rows]
 
 
-def amount_mismatch(conn, as_of, cfg):
-    rows = conn.execute("""
-        SELECT d.deposit_id, d.case_id, d.amount_expected, l.amount
-        FROM deposits d JOIN ledger l ON l.gateway_ref = d.gateway_ref
-        WHERE d.status='received' AND ABS(d.amount_expected - l.amount) > 0.5 AND l.txn_at <= ?
-        GROUP BY d.deposit_id""", (as_of.isoformat(),))
-    return [Finding("AMOUNT_MISMATCH", "high", r["deposit_id"],
-                    f"Case {r['case_id']}: expected {inr(r['amount_expected'])}, gateway settled {inr(r['amount'])}",
-                    abs(r["amount_expected"] - r["amount"])) for r in rows]
+def invoice_not_raised(db, as_of, cfg, _):
+    cutoff = _iso(as_of - timedelta(days=cfg.invoice_sla_days))
+    rows = db.execute("""SELECT * FROM cases WHERE visa_status = 'Approved' AND enrolment_confirmed = 'Yes'
+                         AND invoice_no = '' AND visa_approved_on <> '' AND visa_approved_on <= ?""", (cutoff,))
+    return [Finding("INVOICE_NOT_RAISED", "high", r["case_id"], r["partner"],
+                    f"{r['case_id']} enrolled, visa approved {(as_of - date.fromisoformat(r['visa_approved_on'])).days}d ago, "
+                    f"no invoice to {r['partner']} (expected {money(r['expected_commission'], r['currency'])})",
+                    r["expected_commission"] * r["inr_rate"]) for r in rows]
 
 
-# ---------------------------------------------------------------- collections
-def deposit_overdue(conn, as_of, cfg):
-    cutoff = (as_of - timedelta(days=cfg.deposit_grace_days)).isoformat()
-    rows = conn.execute("""
-        SELECT d.deposit_id, d.case_id, d.amount_expected, d.due_date, c.counsellor
-        FROM deposits d JOIN cases c USING(case_id)
-        WHERE d.status='pending' AND d.due_date < ?""", (cutoff,))
+def enrolment_unconfirmed(db, as_of, cfg, _):
+    cutoff = _iso(as_of - timedelta(days=cfg.enrolment_chase_days))
+    rows = db.execute("""SELECT * FROM cases WHERE visa_status = 'Approved' AND enrolment_confirmed <> 'Yes'
+                         AND invoice_no = '' AND visa_approved_on <> '' AND visa_approved_on <= ?""", (cutoff,))
+    return [Finding("ENROLMENT_UNCONFIRMED", "medium", r["case_id"], r["partner"],
+                    f"{r['case_id']} visa approved {(as_of - date.fromisoformat(r['visa_approved_on'])).days}d ago; "
+                    f"enrolment not confirmed by {r['partner']}, so it can't be invoiced",
+                    r["expected_commission"] * r["inr_rate"]) for r in rows]
+
+
+def commission_overdue(db, as_of, cfg, _):
+    rows = db.execute("""SELECT *, invoice_amount - received AS os FROM cases
+                         WHERE invoice_no <> '' AND received = 0 AND due_date <> '' AND due_date < ?""", (_iso(as_of),))
     out = []
     for r in rows:
         days = (as_of - date.fromisoformat(r["due_date"])).days
-        sev = "high" if days >= cfg.deposit_escalate_days else "medium"
-        out.append(Finding("DEPOSIT_OVERDUE", sev, r["deposit_id"],
-                           f"Case {r['case_id']} deposit {inr(r['amount_expected'])} overdue {days}d (owner: {r['counsellor']})",
-                           r["amount_expected"]))
+        sev = "medium" if days <= 30 else "high" if days <= 60 else "critical"
+        out.append(Finding("COMMISSION_OVERDUE", sev, r["invoice_no"], r["partner"],
+                           f"{r['invoice_no']} ({r['case_id']}) {money(r['os'], r['currency'])} overdue {days}d from {r['partner']}",
+                           r["os"] * r["inr_rate"]))
     return out
 
 
-# ---------------------------------------------------------------- revenue
-def invoice_not_raised(conn, as_of, cfg):
-    cutoff = (as_of - timedelta(days=cfg.invoice_sla_days)).isoformat()
-    rows = conn.execute("""
-        SELECT c.case_id, c.partner, c.visa_approved_at, d.amount_expected
-        FROM cases c JOIN deposits d USING(case_id)
-        LEFT JOIN invoices i USING(case_id)
-        WHERE c.visa_approved_at IS NOT NULL AND c.visa_approved_at <= ? AND i.invoice_id IS NULL""", (cutoff,))
+def short_payment(db, as_of, cfg, _):
+    rows = db.execute("""SELECT *, invoice_amount - received AS os FROM cases
+                         WHERE invoice_no <> '' AND received > 0 AND invoice_amount - received > 0.005""")
     out = []
     for r in rows:
-        days = (as_of - date.fromisoformat(r["visa_approved_at"])).days
-        est = round(r["amount_expected"] * 0.14, -2)          # avg commission rate as estimate
-        out.append(Finding("INVOICE_NOT_RAISED", "high", r["case_id"],
-                           f"Visa approved {days}d ago, no invoice to {r['partner']} (est. commission {inr(est)})", est))
+        if r["os"] <= cfg.bank_charge_tolerance:
+            out.append(Finding("BANK_CHARGES", "low", r["invoice_no"], r["partner"],
+                               f"{r['invoice_no']} paid {money(r['os'], r['currency'])} short; within bank-charge tolerance, "
+                               f"write off or claim back", r["os"] * r["inr_rate"]))
+        else:
+            pct = 100 * r["os"] / r["invoice_amount"]
+            out.append(Finding("SHORT_PAYMENT", "high", r["invoice_no"], r["partner"],
+                               f"{r['invoice_no']} received {money(r['received'], r['currency'])} of "
+                               f"{money(r['invoice_amount'], r['currency'])} ({pct:.0f}% short)", r["os"] * r["inr_rate"]))
     return out
 
 
-def commission_overdue(conn, as_of, cfg):
-    rows = conn.execute("""
-        SELECT i.invoice_id, i.case_id, i.commission_amount, i.commission_due_date, c.partner
-        FROM invoices i JOIN cases c USING(case_id)
-        WHERE i.commission_received_at IS NULL AND i.commission_due_date < ?""", (as_of.isoformat(),))
+def overpayment(db, as_of, cfg, _):
+    rows = db.execute("""SELECT *, received - invoice_amount AS extra FROM cases
+                         WHERE invoice_no <> '' AND received - invoice_amount > ?""", (cfg.bank_charge_tolerance,))
+    return [Finding("OVERPAYMENT", "high", r["invoice_no"], r["partner"],
+                    f"{r['invoice_no']} received {money(r['received'], r['currency'])} against "
+                    f"{money(r['invoice_amount'], r['currency'])}; likely paid twice, refund or credit note needed",
+                    r["extra"] * r["inr_rate"]) for r in rows]
+
+
+def unapplied_cash(db, as_of, cfg, unmatched):
+    fx = {r["currency"]: r["inr_rate"] for r in db.execute("SELECT * FROM fx")}
+    return [Finding("UNAPPLIED_CASH", "high", u["remittance_id"], u["partner"],
+                    f"{money(u['amount'], u['currency'])} from {u['partner']} on {u['date']} "
+                    f"{'references unknown invoice ' + repr(u['invoice_ref']) if u['invoice_ref'] else 'has no invoice reference'}",
+                    u["amount"] * fx.get(u["currency"], 0)) for u in unmatched]
+
+
+def rate_mismatch(db, as_of, cfg, _):
+    rows = db.execute("""SELECT * FROM cases WHERE invoice_no <> '' AND expected_commission > 0
+                         AND ABS(invoice_amount - expected_commission) > expected_commission * ? / 100""",
+                      (cfg.rate_tolerance_pct,))
     out = []
     for r in rows:
-        days = (as_of - date.fromisoformat(r["commission_due_date"])).days
-        out.append(Finding("COMMISSION_OVERDUE", "high" if days > 15 else "medium", r["invoice_id"],
-                           f"{r['partner']} commission {inr(r['commission_amount'])} for {r['case_id']} overdue {days}d",
-                           r["commission_amount"]))
+        billed = r["invoice_amount"] / r["tuition_fee"] * 100
+        out.append(Finding("RATE_MISMATCH", "medium", r["invoice_no"], r["partner"],
+                           f"{r['invoice_no']} billed at {billed:.1f}% vs agreed {r['commission_rate'] * 100:.0f}% "
+                           f"({money(r['invoice_amount'], r['currency'])} vs {money(r['expected_commission'], r['currency'])})",
+                           max(r["expected_commission"] - r["invoice_amount"], 0) * r["inr_rate"]))
     return out
 
 
-# ---------------------------------------------------------------- pipeline health
-def stale_case(conn, as_of, cfg):
-    cutoff = (as_of - timedelta(days=cfg.stale_case_days)).isoformat()
-    rows = conn.execute("""
-        SELECT case_id, stage, stage_updated_at, counsellor FROM cases
-        WHERE stage IN ('deposit_paid','visa_filed') AND stage_updated_at < ?""", (cutoff,))
-    return [Finding("STALE_CASE", "low", r["case_id"],
-                    f"Stuck in '{r['stage']}' since {r['stage_updated_at']} (owner: {r['counsellor']})") for r in rows]
-
-
-def settlement_volume_drop(conn, as_of, cfg):
-    start = as_of - timedelta(days=cfg.volume_lookback_days)
-    counts = {row["txn_at"]: row["n"] for row in conn.execute(
-        "SELECT txn_at, COUNT(*) n FROM ledger WHERE txn_at BETWEEN ? AND ? GROUP BY txn_at",
-        (start.isoformat(), as_of.isoformat()))}
-    series = [counts.get((start + timedelta(days=k)).isoformat(), 0) for k in range(cfg.volume_lookback_days + 1)]
-    history, out = series[:-2], []
-    if len(history) < 5 or statistics.pstdev(history) == 0:
-        return out
-    mu, sd = statistics.mean(history), statistics.pstdev(history)
-    for offset, n in ((1, series[-2]), (0, series[-1])):       # check yesterday and today
-        z = (n - mu) / sd
-        if z <= cfg.volume_z_threshold:
-            day = (as_of - timedelta(days=offset)).isoformat()
-            out.append(Finding("SETTLEMENT_VOLUME_DROP", "medium", day,
-                               f"{n} settlements on {day} vs {mu:.1f}/day normal (z = {z:.1f}); check gateway status"))
+def accrual_variance(db, as_of, cfg, _):
+    closed_before = (as_of - timedelta(days=cfg.accrual_close_days)).replace(day=1).isoformat()[:7]
+    rows = db.execute("""
+        SELECT a.month, a.partner, a.currency, a.accrued_amount, COALESCE(SUM(c.invoice_amount), 0) actual,
+               MAX(f.inr_rate) inr_rate
+        FROM accruals a
+        LEFT JOIN cases c ON c.partner = a.partner AND substr(c.visa_approved_on, 1, 7) = a.month AND c.invoice_no <> ''
+        LEFT JOIN fx f ON f.currency = a.currency
+        WHERE a.month < ? GROUP BY a.month, a.partner""", (closed_before,))
+    out = []
+    for r in rows:
+        if not r["accrued_amount"]:
+            continue
+        var = 100 * (r["actual"] - r["accrued_amount"]) / r["accrued_amount"]
+        gap_inr = abs(r["actual"] - r["accrued_amount"]) * (r["inr_rate"] or 0)
+        if abs(var) > cfg.accrual_variance_pct and gap_inr >= cfg.accrual_min_gap_inr:
+            out.append(Finding("ACCRUAL_VARIANCE", "medium", f"{r['month']}/{code(r['partner'])}", r["partner"],
+                               f"{r['month']} {r['partner']}: accrued {money(r['accrued_amount'], r['currency'])}, "
+                               f"invoiced {money(r['actual'], r['currency'])} ({var:+.0f}%)",
+                               0))      # the money sits on the underlying cases; counting it here would double it
     return out
 
 
 RULES: list[Rule] = [
-    Rule("DUPLICATE_SETTLEMENT", "Duplicate settlement",
-         "A student may have been charged twice: refund liability and a trust problem.",
-         ["Was the payment retried after a gateway timeout?", "Check for a webhook firing twice",
-          "Confirm with the gateway before refunding"], duplicate_settlement),
-    Rule("UNRECONCILED_SETTLEMENT", "Money received, no matching deposit",
-         "Cash on the books that ops can't attribute; it blocks month-end close.",
-         ["Was the gateway ref mistyped when the deposit was marked paid?",
-          "Is it a payment for a case not yet created in the system?", "Search by amount + date window"],
-         orphan_settlement),
-    Rule("AMOUNT_MISMATCH", "Short or over settlement",
-         "Expected vs actual difference: gateway fees, FX, or partial payment not followed up.",
-         ["Is the gap equal to the gateway's fee slab?", "Was a partial payment agreed with the student?",
-          "Check the FX rate if paid in foreign currency"], amount_mismatch),
-    Rule("DEPOSIT_OVERDUE", "Deposit overdue",
-         "Uncollected deposits delay offer confirmation and visa filing.",
-         ["Has the counsellor followed up in the last 48h?", "Is the payment link expired?",
-          "Group by counsellor to see if it's one person's pipeline"], deposit_overdue),
-    Rule("INVOICE_NOT_RAISED", "Visa approved, invoice not raised",
+    Rule("DUPLICATE_INVOICE_NO", "Same invoice number on two cases",
+         "Payments get applied to the wrong student and the partner may reject both invoices.",
+         ["Which case was invoiced first? Re-number the other", "Was a row copy-pasted in the tracker?"], duplicate_invoice_no),
+    Rule("INVOICE_NOT_RAISED", "Enrolled, but not invoiced",
          "Direct revenue leakage: commission isn't claimed until the invoice is raised.",
-         ["Is the enrolment confirmation from the partner missing?", "Was the case closed in CRM but not handed to finance?",
-          "Check if the partner needs a specific invoice format"], invoice_not_raised),
-    Rule("COMMISSION_OVERDUE", "Partner commission overdue",
-         "Receivables ageing, which hits cash flow and accrual accuracy.",
-         ["Did the partner acknowledge the invoice?", "Is the student's enrolment confirmed on the partner side?",
+         ["Is the partner's enrolment confirmation filed?", "Was the case handed over from counselling to finance?",
+          "Does the partner need a specific invoice format or portal upload?"], invoice_not_raised),
+    Rule("ENROLMENT_UNCONFIRMED", "Visa approved, enrolment not confirmed",
+         "Can't invoice until the partner confirms; the longer it waits, the more likely the student deferred or dropped.",
+         ["Check the partner portal for enrolment status", "Ask the counsellor if the student deferred",
+          "Chase the partner contact in one batch email"], enrolment_unconfirmed),
+    Rule("COMMISSION_OVERDUE", "Commission overdue",
+         "Receivables ageing: hits cash flow, and 60+ day items are at real risk of never being paid.",
+         ["Did the partner acknowledge the invoice?", "Check unapplied cash from the same partner: it may already be paid",
           "Escalate partners with 3+ overdue invoices"], commission_overdue),
-    Rule("STALE_CASE", "Case stuck in stage",
-         "Silent pipeline leakage; nobody is chasing it.",
-         ["Missing documents?", "Owner on leave or overloaded?"], stale_case),
-    Rule("SETTLEMENT_VOLUME_DROP", "Settlement volume anomaly",
-         "A sudden drop usually means a gateway or integration failure, not a demand change.",
-         ["Check gateway status page and webhook logs", "Compare with payment link clicks",
-          "Did a deploy go out yesterday?"], settlement_volume_drop),
+    Rule("SHORT_PAYMENT", "Short payment",
+         "Received less than invoiced beyond bank charges: wrong rate on their side, partial scholarship, or a dispute.",
+         ["Compare with the partner's remittance advice", "Did the student get a fee discount that changes the commission base?",
+          "Raise a balance-due note"], short_payment),
+    Rule("BANK_CHARGES", "Small shortfall (bank charges)",
+         "Intermediary bank fees on international transfers; small, but they add up across hundreds of invoices.",
+         ["Write off under the bank-charges threshold", "Ask the partner to pay charges as 'OUR' on the SWIFT transfer"], short_payment),
+    Rule("OVERPAYMENT", "Overpayment / paid twice",
+         "Money that isn't ours: needs a refund or a credit note before audit.",
+         ["Was the same invoice paid twice, a few days apart?", "Offset against the partner's next invoice, with a credit note"],
+         overpayment),
+    Rule("UNAPPLIED_CASH", "Payment with no matching invoice",
+         "Cash in the bank that ops can't attribute; meanwhile the invoice it was meant for shows as overdue.",
+         ["Look for an overdue invoice from the same partner with the same amount",
+          "Check for typos in the invoice reference", "Request the remittance advice"], unapplied_cash),
+    Rule("RATE_MISMATCH", "Billed at the wrong commission rate",
+         "Under-billing loses revenue; over-billing gets the invoice disputed and paid late.",
+         ["Is the partner agreement rate up to date in Partners?", "Was an old rate template used?"], rate_mismatch),
+    Rule("ACCRUAL_VARIANCE", "Accrual vs actual variance",
+         "Finance booked revenue that hasn't been invoiced (or vice versa): month-end numbers are off.",
+         ["Which cases from that month are not invoiced or enrolled yet?", "Was the accrual built on an outdated case list?"],
+         accrual_variance),
 ]
 RULES_BY_CODE = {r.code: r for r in RULES}
 
 
-def run_all(conn: sqlite3.Connection, as_of: date, cfg: Config | None = None) -> list[Finding]:
+def run_all(db: sqlite3.Connection, as_of: date, unmatched: list[dict], cfg: Config | None = None) -> list[Finding]:
     cfg = cfg or Config()
-    findings: list[Finding] = []
+    seen, findings = set(), []
     for rule in RULES:
-        findings.extend(rule.fn(conn, as_of, cfg))
-    return sorted(findings, key=lambda f: (SEVERITY_ORDER[f.severity], -f.amount_at_risk))
+        for f in rule.fn(db, as_of, cfg, unmatched):
+            if f.issue_id not in seen:          # SHORT_PAYMENT / BANK_CHARGES share one function
+                seen.add(f.issue_id)
+                f.at_risk_inr = round(f.at_risk_inr or 0, 0)
+                findings.append(f)
+    return sorted(findings, key=lambda f: (SEVERITY_ORDER[f.severity], -f.at_risk_inr))
