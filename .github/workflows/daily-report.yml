@@ -1,0 +1,19 @@
+# Runs the checks every morning at 08:30 IST and publishes the report as a build artifact.
+name: daily-ops-report
+on:
+  schedule:
+    - cron: "0 3 * * *"        # 03:00 UTC = 08:30 IST
+  workflow_dispatch:
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[dev]"
+      - run: pytest -q
+      - run: python -m ops_sentinel.cli seed && python -m ops_sentinel.cli report --out reports | tee summary.md
+      - run: cat summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with: { name: ops-report, path: reports/ }

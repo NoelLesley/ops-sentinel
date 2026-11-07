@@ -1,0 +1,16 @@
+[project]
+name = "ops-sentinel"
+version = "0.1.0"
+description = "MCP server that monitors payments & receivables operations: reconciliation, collections, invoicing and commission ageing."
+requires-python = ">=3.10"
+dependencies = ["mcp>=2.0"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+ops-sentinel = "ops_sentinel.cli:main"
+ops-sentinel-mcp = "ops_sentinel.server:main"
+
+[tool.setuptools]
+packages = ["ops_sentinel"]

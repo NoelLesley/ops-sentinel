@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ops-sentinel": {
+      "command": "python3",
+      "args": ["-m", "ops_sentinel.server"],
+      "env": {
+        "PYTHONPATH": "/ABSOLUTE/PATH/TO/ops-sentinel",
+        "OPS_SENTINEL_DB": "/ABSOLUTE/PATH/TO/ops-sentinel/data/ops.db"
+      }
+    }
+  }
+}
